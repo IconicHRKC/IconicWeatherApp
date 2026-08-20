@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: iconic-storm-watch
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --workers 1 --threads 4 --timeout 120 app:app
+    envVars:
+      - key: POLL_INTERVAL_MINUTES
+        value: "10"
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_SMS_FROM
+        sync: false
+      - key: TWILIO_WHATSAPP_FROM
+        sync: false
+      - key: ALERT_TO_PHONE
+        value: "+19137872654"
+      - key: DASHBOARD_URL
+        sync: false

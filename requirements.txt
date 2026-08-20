@@ -1,0 +1,5 @@
+flask==3.0.3
+requests==2.32.3
+twilio==9.3.6
+apscheduler==3.10.4
+gunicorn==22.0.0
