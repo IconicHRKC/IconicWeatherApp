@@ -32,7 +32,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from storm_data import fetch_and_filter_reports
 from notifier import send_storm_alert
 
-app = Flask(__name__)
+app = Flask(__name__, template_folder=".")
 
 STATE_FILE = Path(__file__).parent / "storm_state.json"
 POLL_INTERVAL_MINUTES = int(os.environ.get("POLL_INTERVAL_MINUTES", "10"))
