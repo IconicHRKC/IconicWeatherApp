@@ -99,7 +99,7 @@ def api_reports():
     })
 
 
-@app.route("/api/poll-now", methods=["POST"])
+@app.route("/api/poll-now", methods=["GET", "POST"])
 def api_poll_now():
     """Manual trigger - useful for testing without waiting for the
     scheduler, or for wiring a 'refresh now' button later."""
