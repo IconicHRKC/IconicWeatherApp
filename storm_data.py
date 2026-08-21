@@ -58,12 +58,9 @@ def haversine_miles(lat1, lon1, lat2, lon2):
 
 
 def _spc_latlon(raw_lat, raw_lon):
-    """SPC encodes lat/lon as integers without a decimal point, e.g.
-    3910 -> 39.10, -9458 -> -94.58. Longitude is given as a positive
-    number meaning "west" so we negate it."""
-    lat = float(raw_lat) / 100.0
-    lon = -float(raw_lon) / 100.0
-    return lat, lon
+    """SPC's modern hail/wind/torn CSVs give lat/lon already as plain
+    decimal degrees (e.g. 38.78, -85.38) - no scaling needed."""
+    return float(raw_lat), float(raw_lon)
 
 
 def _fetch_csv(url):
