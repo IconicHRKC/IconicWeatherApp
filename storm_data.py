@@ -1,21 +1,21 @@
 """
 storm_data.py
 Fetches severe weather reports from NOAA's Storm Prediction Center (SPC)
-and the National Weather Service (NWS), filters them to a radius around
-Kansas City, and normalizes them into the shape the dashboard expects.
+for a rolling window of days, filters them to a radius around Kansas
+City, and normalizes them into the shape the dashboard expects.
 
 Data sources (all free / public, no API key required):
   - SPC Local Storm Reports (hail, wind, tornado):
-      https://www.spc.noaa.gov/climo/reports/today.csv  (raw combined)
-      We instead pull the three typed CSVs, which are easier to parse:
-      https://www.spc.noaa.gov/climo/reports/today_hail.csv
-      https://www.spc.noaa.gov/climo/reports/today_wind.csv
-      https://www.spc.noaa.gov/climo/reports/today_torn.csv
+      Today:       https://www.spc.noaa.gov/climo/reports/today_hail.csv
+                    https://www.spc.noaa.gov/climo/reports/today_wind.csv
+                    https://www.spc.noaa.gov/climo/reports/today_torn.csv
+      Past days:   https://www.spc.noaa.gov/climo/reports/YYMMDD_rpts_hail.csv
+                    https://www.spc.noaa.gov/climo/reports/YYMMDD_rpts_wind.csv
+                    https://www.spc.noaa.gov/climo/reports/YYMMDD_rpts_torn.csv
     NOTE: SPC's "today" is a convective day that starts around 06Z
     (roughly 1am CDT), matching how meteorologists group storm days.
-  - NWS active alerts (severe thunderstorm / tornado / winter storm
-    warnings currently in effect), used as a supplementary signal:
-      https://api.weather.gov/alerts/active?point={lat},{lon}
+    Past days' files don't change once the day is over, so we cache
+    them in memory and only ever re-fetch "today".
   - Reverse geocoding (lat/lon -> ZIP code) via OpenStreetMap Nominatim:
       https://nominatim.openstreetmap.org/reverse
     Nominatim's usage policy allows light, non-bulk use with a proper
@@ -27,7 +27,7 @@ import csv
 import io
 import math
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import requests
 
 # ---- Coverage area -----------------------------------------------------
@@ -36,12 +36,16 @@ KC_LAT = 39.0997
 KC_LON = -94.5786
 RADIUS_MILES = 30
 ALLOWED_STATES = {"KS", "MO"}
+LOOKBACK_DAYS = 15  # how many days of history to include, in addition to today
 
 USER_AGENT = "IconicStormWatch/1.0 (hello@iconichrkc.com)"
 
 SPC_BASE = "https://www.spc.noaa.gov/climo/reports"
-NWS_ALERTS = "https://api.weather.gov/alerts/active"
 NOMINATIM = "https://nominatim.openstreetmap.org/reverse"
+
+# Cache of historical (already-finalized) day CSVs, keyed by "YYMMDD".
+# Today's data is never cached here since it changes throughout the day.
+_day_cache = {}
 
 
 def haversine_miles(lat1, lon1, lat2, lon2):
@@ -89,100 +93,108 @@ def _reverse_geocode_zip(lat, lon, cache):
     return zip_code
 
 
-def _today_convective_date():
-    # SPC "today" reports cover roughly 06Z to 06Z; using UTC date is a
-    # reasonable approximation for which file to pull.
-    return datetime.now(timezone.utc).strftime("%y%m%d")
+def _parse_hail_row(r):
+    try:
+        lat, lon = _spc_latlon(r["Lat"], r["Lon"])
+    except (KeyError, ValueError):
+        return None
+    size_hundredths = r.get("Size", "").strip()
+    try:
+        size_in = float(size_hundredths) / 100.0
+        impact = f"Hail size: {size_in:.2f} in"
+    except ValueError:
+        impact = "Hail reported (size unconfirmed)"
+    return {
+        "raw_type": "Hail", "time": r.get("Time", "").strip(),
+        "location": r.get("Location", "").strip(), "county": r.get("County", "").strip(),
+        "state": r.get("State", "").strip(), "lat": lat, "lon": lon,
+        "impact": impact, "comments": r.get("Comments", "").strip(),
+    }
 
 
-def _fetch_hail():
-    rows = _fetch_csv(f"{SPC_BASE}/today_hail.csv")
-    out = []
-    for r in rows:
+def _parse_wind_row(r):
+    try:
+        lat, lon = _spc_latlon(r["Lat"], r["Lon"])
+    except (KeyError, ValueError):
+        return None
+    speed = r.get("Speed", "").strip()
+    impact = f"Wind gust: {speed} mph" if speed and speed.upper() != "UNK" \
+        else "Damaging wind reported (speed unconfirmed)"
+    return {
+        "raw_type": "Wind", "time": r.get("Time", "").strip(),
+        "location": r.get("Location", "").strip(), "county": r.get("County", "").strip(),
+        "state": r.get("State", "").strip(), "lat": lat, "lon": lon,
+        "impact": impact, "comments": r.get("Comments", "").strip(),
+    }
+
+
+def _parse_tornado_row(r):
+    try:
+        lat, lon = _spc_latlon(r["Lat"], r["Lon"])
+    except (KeyError, ValueError):
+        return None
+    return {
+        "raw_type": "Tornado", "time": r.get("Time", "").strip(),
+        "location": r.get("Location", "").strip(), "county": r.get("County", "").strip(),
+        "state": r.get("State", "").strip(), "lat": lat, "lon": lon,
+        "impact": "Tornado reported", "comments": r.get("Comments", "").strip(),
+    }
+
+
+_PARSERS = {"hail": _parse_hail_row, "wind": _parse_wind_row, "torn": _parse_tornado_row}
+
+
+def _fetch_day(day: datetime, is_today: bool):
+    """Fetch hail/wind/tornado reports for one convective day. Returns a
+    list of normalized (but not yet filtered/geocoded) report dicts, each
+    tagged with the calendar date it belongs to."""
+    yymmdd = day.strftime("%y%m%d")
+    date_str = day.strftime("%Y-%m-%d")
+
+    if not is_today and yymmdd in _day_cache:
+        return _day_cache[yymmdd]
+
+    day_reports = []
+    for kind, parser in _PARSERS.items():
+        url = f"{SPC_BASE}/today_{kind}.csv" if is_today else f"{SPC_BASE}/{yymmdd}_rpts_{kind}.csv"
         try:
-            lat, lon = _spc_latlon(r["Lat"], r["Lon"])
-        except (KeyError, ValueError):
+            rows = _fetch_csv(url)
+        except Exception as exc:
+            print(f"[storm_data] fetch failed for {url}: {exc}")
             continue
-        size_hundredths = r.get("Size", "").strip()
-        try:
-            size_in = float(size_hundredths) / 100.0
-            impact = f"Hail size: {size_in:.2f} in"
-        except ValueError:
-            impact = "Hail reported (size unconfirmed)"
-        out.append({
-            "raw_type": "Hail",
-            "time": r.get("Time", "").strip(),
-            "location": r.get("Location", "").strip(),
-            "county": r.get("County", "").strip(),
-            "state": r.get("State", "").strip(),
-            "lat": lat, "lon": lon,
-            "impact": impact,
-            "comments": r.get("Comments", "").strip(),
-        })
-    return out
+        for r in rows:
+            parsed = parser(r)
+            if parsed:
+                parsed["date"] = date_str
+                day_reports.append(parsed)
+
+    if not is_today:
+        _day_cache[yymmdd] = day_reports
+
+    return day_reports
 
 
-def _fetch_wind():
-    rows = _fetch_csv(f"{SPC_BASE}/today_wind.csv")
-    out = []
-    for r in rows:
-        try:
-            lat, lon = _spc_latlon(r["Lat"], r["Lon"])
-        except (KeyError, ValueError):
-            continue
-        speed = r.get("Speed", "").strip()
-        if speed and speed.upper() != "UNK":
-            impact = f"Wind gust: {speed} mph"
-        else:
-            impact = "Damaging wind reported (speed unconfirmed)"
-        out.append({
-            "raw_type": "Wind",
-            "time": r.get("Time", "").strip(),
-            "location": r.get("Location", "").strip(),
-            "county": r.get("County", "").strip(),
-            "state": r.get("State", "").strip(),
-            "lat": lat, "lon": lon,
-            "impact": impact,
-            "comments": r.get("Comments", "").strip(),
-        })
-    return out
-
-
-def _fetch_tornado():
-    rows = _fetch_csv(f"{SPC_BASE}/today_torn.csv")
-    out = []
-    for r in rows:
-        try:
-            lat, lon = _spc_latlon(r["Lat"], r["Lon"])
-        except (KeyError, ValueError):
-            continue
-        out.append({
-            "raw_type": "Tornado",
-            "time": r.get("Time", "").strip(),
-            "location": r.get("Location", "").strip(),
-            "county": r.get("County", "").strip(),
-            "state": r.get("State", "").strip(),
-            "lat": lat, "lon": lon,
-            "impact": "Tornado reported",
-            "comments": r.get("Comments", "").strip(),
-        })
-    return out
-
-
-def fetch_and_filter_reports(zip_cache=None):
+def fetch_and_filter_reports(zip_cache=None, lookback_days: int = LOOKBACK_DAYS):
     """Returns a list of normalized report dicts within RADIUS_MILES of
-    Kansas City and inside ALLOWED_STATES."""
+    Kansas City and inside ALLOWED_STATES, covering today plus the past
+    `lookback_days` days. The window always slides forward with "today" -
+    no fixed dates, so it's always "now back N days" on every call."""
     if zip_cache is None:
         zip_cache = {}
 
+    now = datetime.now(timezone.utc)
     raw_reports = []
-    for fetch_fn in (_fetch_hail, _fetch_wind, _fetch_tornado):
-        try:
-            raw_reports.extend(fetch_fn())
-        except Exception as exc:
-            print(f"[storm_data] fetch failed for {fetch_fn.__name__}: {exc}")
+    valid_yymmdd = set()
+    for offset in range(0, lookback_days + 1):
+        day = now - timedelta(days=offset)
+        valid_yymmdd.add(day.strftime("%y%m%d"))
+        raw_reports.extend(_fetch_day(day, is_today=(offset == 0)))
 
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Drop cached days that have aged out of the rolling window, so memory
+    # doesn't grow unbounded on a service that stays up for months.
+    for stale_key in [k for k in _day_cache if k not in valid_yymmdd]:
+        del _day_cache[stale_key]
+
     results = []
     for r in raw_reports:
         if r["state"] not in ALLOWED_STATES:
@@ -195,7 +207,7 @@ def fetch_and_filter_reports(zip_cache=None):
         t = r["time"]
         time_fmt = f"{t[:2]}:{t[2:]}" if len(t) == 4 else t
 
-        report_id = f"{r['raw_type']}-{r['time']}-{r['lat']}-{r['lon']}"
+        report_id = f"{r['raw_type']}-{r['date']}-{r['time']}-{r['lat']}-{r['lon']}"
         results.append({
             "id": report_id,
             "type": r["raw_type"],
@@ -204,12 +216,12 @@ def fetch_and_filter_reports(zip_cache=None):
             "county": r["county"],
             "state": r["state"],
             "zip_codes": [zip_code] if zip_code else [],
-            "date": today_str,
+            "date": r["date"],
             "time": time_fmt,
             "source": "NOAA Storm Prediction Center (Local Storm Report)",
             "distance_mi": round(dist, 1),
             "comments": r["comments"],
         })
 
-    results.sort(key=lambda x: x["time"], reverse=True)
+    results.sort(key=lambda x: (x["date"], x["time"]), reverse=True)
     return results
