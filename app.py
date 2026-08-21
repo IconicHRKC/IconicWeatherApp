@@ -102,7 +102,8 @@ def api_reports():
 @app.route("/api/poll-now", methods=["GET", "POST"])
 def api_poll_now():
     """Manual trigger - useful for testing without waiting for the
-    scheduler, or for wiring a 'refresh now' button later."""
+    scheduler. Accepts GET too so it can be triggered by just visiting
+    the URL in a browser tab, no terminal needed."""
     poll_once()
     return jsonify({"status": "ok"})
 
