@@ -144,19 +144,34 @@ def _parse_tornado_row(r):
 _PARSERS = {"hail": _parse_hail_row, "wind": _parse_wind_row, "torn": _parse_tornado_row}
 
 
-def _fetch_day(day: datetime, is_today: bool):
+def _fetch_day(day: datetime, offset: int):
     """Fetch hail/wind/tornado reports for one convective day. Returns a
     list of normalized (but not yet filtered/geocoded) report dicts, each
-    tagged with the calendar date it belongs to."""
+    tagged with the calendar date it belongs to.
+
+    offset 0 = today (always re-fetched, uses today_*.csv - updates live)
+    offset 1 = yesterday (uses yesterday_*.csv - SPC updates this fast;
+               the dated archive file for a day this recent can lag
+               behind while final quality control finishes)
+    offset 2+ = older, already-finalized days (uses the dated archive,
+               cached in memory since it won't change anymore)
+    """
     yymmdd = day.strftime("%y%m%d")
     date_str = day.strftime("%Y-%m-%d")
+    is_today = offset == 0
+    cache_key = yymmdd if offset != 1 else f"y-{yymmdd}"  # keep yesterday's slot distinct
 
-    if not is_today and yymmdd in _day_cache:
-        return _day_cache[yymmdd]
+    if offset >= 2 and cache_key in _day_cache:
+        return _day_cache[cache_key]
 
     day_reports = []
     for kind, parser in _PARSERS.items():
-        url = f"{SPC_BASE}/today_{kind}.csv" if is_today else f"{SPC_BASE}/{yymmdd}_rpts_{kind}.csv"
+        if offset == 0:
+            url = f"{SPC_BASE}/today_{kind}.csv"
+        elif offset == 1:
+            url = f"{SPC_BASE}/yesterday_{kind}.csv"
+        else:
+            url = f"{SPC_BASE}/{yymmdd}_rpts_{kind}.csv"
         try:
             rows = _fetch_csv(url)
         except Exception as exc:
@@ -168,8 +183,8 @@ def _fetch_day(day: datetime, is_today: bool):
                 parsed["date"] = date_str
                 day_reports.append(parsed)
 
-    if not is_today:
-        _day_cache[yymmdd] = day_reports
+    if offset >= 2:
+        _day_cache[cache_key] = day_reports
 
     return day_reports
 
@@ -184,15 +199,16 @@ def fetch_and_filter_reports(zip_cache=None, lookback_days: int = LOOKBACK_DAYS)
 
     now = datetime.now(timezone.utc)
     raw_reports = []
-    valid_yymmdd = set()
+    valid_keys = set()
     for offset in range(0, lookback_days + 1):
         day = now - timedelta(days=offset)
-        valid_yymmdd.add(day.strftime("%y%m%d"))
-        raw_reports.extend(_fetch_day(day, is_today=(offset == 0)))
+        yymmdd = day.strftime("%y%m%d")
+        valid_keys.add(yymmdd if offset != 1 else f"y-{yymmdd}")
+        raw_reports.extend(_fetch_day(day, offset))
 
     # Drop cached days that have aged out of the rolling window, so memory
     # doesn't grow unbounded on a service that stays up for months.
-    for stale_key in [k for k in _day_cache if k not in valid_yymmdd]:
+    for stale_key in [k for k in _day_cache if k not in valid_keys]:
         del _day_cache[stale_key]
 
     results = []
