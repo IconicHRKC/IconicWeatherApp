@@ -237,6 +237,8 @@ def fetch_and_filter_reports(zip_cache=None, lookback_days: int = LOOKBACK_DAYS)
             "source": "NOAA Storm Prediction Center (Local Storm Report)",
             "distance_mi": round(dist, 1),
             "comments": r["comments"],
+            "lat": r["lat"],
+            "lon": r["lon"],
         })
 
     print(f"[storm_data] fetched {len(raw_reports)} raw reports across "
