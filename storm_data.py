@@ -175,9 +175,9 @@ def _fetch_day(day: datetime, offset: int):
         try:
             rows = _fetch_csv(url)
         except Exception as exc:
-            print(f"[storm_data] fetch failed for {url}: {exc}")
+            print(f"[storm_data] fetch failed for {url}: {exc}", flush=True)
             continue
-        print(f"[storm_data] {url} -> {len(rows)} rows")
+        print(f"[storm_data] {url} -> {len(rows)} rows", flush=True)
         for r in rows:
             parsed = parser(r)
             if parsed:
@@ -244,7 +244,7 @@ def fetch_and_filter_reports(zip_cache=None, lookback_days: int = LOOKBACK_DAYS)
 
     print(f"[storm_data] fetched {len(raw_reports)} raw reports across "
           f"{lookback_days + 1} days | {state_matches} in KS/MO | "
-          f"{len(results)} within {RADIUS_MILES}mi of KC")
+          f"{len(results)} within {RADIUS_MILES}mi of KC", flush=True)
 
     results.sort(key=lambda x: (x["date"], x["time"]), reverse=True)
     return results
